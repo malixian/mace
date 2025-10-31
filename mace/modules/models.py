@@ -35,6 +35,8 @@ from .utils import (
     prepare_graph,
 )
 
+import time
+from torch.profiler import profile, record_function, ProfilerActivity
 # pylint: disable=C0302
 
 
@@ -359,6 +361,23 @@ class ScaleShiftMACE(MACE):
         compute_atomic_stresses: bool = False,
         lammps_mliap: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
+        
+        '''
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+
+        prof = profile(
+            activities=activities,
+            record_shapes=True,
+            with_stack=True,
+        )
+
+        prof.start()
+        prof.step()
+        '''
+
         # Setup
         ctx = prepare_graph(
             data,
@@ -380,6 +399,10 @@ class ScaleShiftMACE(MACE):
         interaction_kwargs = ctx.interaction_kwargs
         lammps_natoms = interaction_kwargs.lammps_natoms
         lammps_class = interaction_kwargs.lammps_class
+        
+        torch.cuda.synchronize()
+        forward_start_time = time.perf_counter() * 1000
+        start_time = time.perf_counter() * 1000
 
         # Atomic energies
         node_e0 = self.atomic_energies_fn(data["node_attrs"])[
@@ -396,6 +419,11 @@ class ScaleShiftMACE(MACE):
             lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
         )
 
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= embedding cost: {execution_time_ms:.3f} ms ========")
+
         if hasattr(self, "pair_repulsion"):
             pair_node_energy = self.pair_repulsion_fn(
                 lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
@@ -404,7 +432,7 @@ class ScaleShiftMACE(MACE):
                 pair_node_energy = pair_node_energy[: lammps_natoms[0]]
         else:
             pair_node_energy = torch.zeros_like(node_e0)
-
+        
         # Interactions
         node_es_list = [pair_node_energy]
         node_feats_list: List[torch.Tensor] = []
@@ -415,6 +443,10 @@ class ScaleShiftMACE(MACE):
             node_attrs_slice = data["node_attrs"]
             if is_lammps and i > 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             node_feats, sc = interaction(
                 node_attrs=node_attrs_slice,
                 node_feats=node_feats,
@@ -425,15 +457,38 @@ class ScaleShiftMACE(MACE):
                 lammps_class=lammps_class,
                 lammps_natoms=lammps_natoms,
             )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= interaction cost: {execution_time_ms:.3f} ms ========")
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= product cost: {execution_time_ms:.3f} ms ========")
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             node_feats_list.append(node_feats)
             node_es_list.append(
                 readout(node_feats, node_heads)[num_atoms_arange, node_heads]
             )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= readout cost: {execution_time_ms:.3f} ms ========")
 
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)
@@ -442,6 +497,14 @@ class ScaleShiftMACE(MACE):
 
         total_energy = e0 + inter_e
         node_energy = node_e0.clone().double() + node_inter_es.clone().double()
+
+        torch.cuda.synchronize()
+        forward_end_time = time.perf_counter() * 1000
+        execution_time_ms = forward_end_time - forward_start_time
+        print(f"========= {node_heads.shape[0]} forward cost: {execution_time_ms:.3f} ms ========")
+
+        torch.cuda.synchronize()
+        backward_start_time = time.perf_counter() * 1000
 
         forces, virials, stress, hessian, edge_forces = get_outputs(
             energy=inter_e,
@@ -457,6 +520,11 @@ class ScaleShiftMACE(MACE):
             compute_edge_forces=compute_edge_forces or compute_atomic_stresses,
         )
 
+        torch.cuda.synchronize()
+        backward_end_time = time.perf_counter() * 1000
+        execution_time_ms = backward_end_time - backward_start_time
+        print(f"========= Batch: {node_heads.shape[0]}, backward cost: {execution_time_ms:.3f} ms ========")
+
         atomic_virials: Optional[torch.Tensor] = None
         atomic_stresses: Optional[torch.Tensor] = None
         if compute_atomic_stresses and edge_forces is not None:
@@ -468,6 +536,12 @@ class ScaleShiftMACE(MACE):
                 batch=data["batch"],
                 cell=cell,
             )
+
+        '''
+        prof.stop()
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        '''
         return {
             "energy": total_energy,
             "node_energy": node_energy,

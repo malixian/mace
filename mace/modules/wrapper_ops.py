@@ -11,6 +11,8 @@ from e3nn import o3
 from mace.modules.symmetric_contraction import SymmetricContraction
 from mace.tools.cg import O3_e3nn
 
+import time
+
 try:
     import cuequivariance as cue
     import cuequivariance_torch as cuet
@@ -68,6 +70,7 @@ class Linear:
                 layout=cueq_config.layout,
                 shared_weights=shared_weights,
                 use_fallback=True,
+                use_fasteq=True,
             )
 
         return o3.Linear(
@@ -106,6 +109,7 @@ class TensorProduct:
                 internal_weights=internal_weights,
                 dtype=torch.get_default_dtype(),
                 math_dtype=torch.get_default_dtype(),
+                use_fasteq=True,
             )
 
         return o3.TensorProduct(
@@ -144,6 +148,7 @@ class FullyConnectedTensorProduct:
                 shared_weights=shared_weights,
                 internal_weights=internal_weights,
                 use_fallback=True,
+                use_fasteq=True,
             )
 
         return o3.FullyConnectedTensorProduct(
@@ -182,6 +187,7 @@ class SymmetricContractionWrapper:
                 original_mace=True,
                 dtype=torch.get_default_dtype(),
                 math_dtype=torch.get_default_dtype(),
+                use_fasteq=True,
             )
 
         return SymmetricContraction(

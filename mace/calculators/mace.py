@@ -35,6 +35,7 @@ from mace.tools import (
 )
 
 import time
+from tqdm import tqdm
 
 # Import graph construction kernels
 
@@ -78,6 +79,7 @@ class MACECalculator(Calculator):
         compile_mode=None,
         fullgraph=True,
         enable_cueq=False,
+        use_batch_size=1,
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
@@ -107,6 +109,8 @@ class MACECalculator(Calculator):
 
         self.model_type = model_type
         self.compute_atomic_stresses = False
+
+        self.batch_size = use_batch_size
 
         if model_type == "MACE":
             self.implemented_properties = [
@@ -309,6 +313,22 @@ class MACECalculator(Calculator):
         )
         batch = next(iter(data_loader)).to(self.device)
         return batch
+    
+    def _batch_data_loader(self, atoms_list):
+        configs = [data.config_from_atoms(atoms) for atoms in atoms_list]
+        data_loader = torch_geometric.dataloader.DataLoader(
+            dataset=[
+                data.AtomicData.from_config(
+                    config, z_table=self.z_table, cutoff=self.r_max, heads=self.available_heads
+                    # config, z_table=self.z_table, cutoff=self.r_max, heads=self.heads
+                )
+                for config in configs
+            ],
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+        return data_loader
 
     def _clone_batch(self, batch):
         batch_clone = batch.clone()
@@ -459,6 +479,7 @@ class MACECalculator(Calculator):
         
         calc_end_t = time.perf_counter()
         self.calc_time += (calc_end_t - calc_start_t)
+        print(f"=== mace calculate cost {self.calc_time} ===")
 
     def get_hessian(self, atoms=None):
         if atoms is None and self.atoms is None:
@@ -723,3 +744,33 @@ class MACECalculator(Calculator):
         # print(f'&&& predictions["forces"] in predict: {predictions["forces"]}')
 
         return predictions
+    
+    def batch_calculate(self, atoms_list=None, properties=None, system_changes=all_changes):
+        """
+        Calculate properties.
+        :param atoms: ase.Atoms object
+        :param properties: [str], properties to be computed, used by ASE internally
+        :param system_changes: [str], system changes since last calculation, used by ASE internally
+        :return:
+        """
+        # call to base-class to set atoms attribute
+        Calculator.calculate(self, atoms_list[0])
+
+        data_loader = self._batch_data_loader(atoms_list)
+
+        if self.model_type in ["MACE", "EnergyDipoleMACE"]:
+            compute_stress = not self.use_compile
+        else:
+            compute_stress = False
+
+        for i, model in enumerate(self.models):
+            for batch_base in tqdm(data_loader, desc="Inference", unit="batch"):
+                batch_base = batch_base.to(self.device)
+                batch = self._clone_batch(batch_base)
+                out = model(
+                    batch.to_dict(),
+                    compute_stress=compute_stress,
+                    training=self.use_compile,
+                )
+                print(f"================= batch output energy:{out['energy']} =================")
+                print(f"================= batch output forces:{out['forces']} =================")

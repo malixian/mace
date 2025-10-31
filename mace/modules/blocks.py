@@ -33,6 +33,7 @@ from .radial import (
     SoftTransform,
 )
 
+import time
 
 @compile_mode("script")
 class LinearNodeEmbeddingBlock(torch.nn.Module):
@@ -446,24 +447,32 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         receiver = edge_index[1]
         num_nodes = node_feats.shape[0]
         n_real = lammps_natoms[0] if lammps_class is not None else None
+        
         node_feats = self.linear_up(node_feats)
+
         node_feats = self.handle_lammps(
             node_feats,
             lammps_class=lammps_class,
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
+        
         tp_weights = self.conv_tp_weights(edge_feats)
+            
         mji = self.conv_tp(
             node_feats[sender], edge_attrs, tp_weights
         )  # [n_edges, irreps]
+        
         message = scatter_sum(
             src=mji, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, irreps]
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
+
         message = self.linear(message) / self.avg_num_neighbors
+        
         message = self.skip_tp(message, node_attrs)
+
         return (
             self.reshape(message),
             None,
@@ -540,25 +549,33 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         receiver = edge_index[1]
         num_nodes = node_feats.shape[0]
         n_real = lammps_natoms[0] if lammps_class is not None else None
+        
         sc = self.skip_tp(node_feats, node_attrs)
+
         node_feats = self.linear_up(node_feats)
+
         node_feats = self.handle_lammps(
             node_feats,
             lammps_class=lammps_class,
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
+        
         tp_weights = self.conv_tp_weights(edge_feats)
+        
         mji = self.conv_tp(
             node_feats[sender], edge_attrs, tp_weights
         )  # [n_edges, irreps]
+        
         message = scatter_sum(
             src=mji, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, irreps]
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
         sc = self.truncate_ghosts(sc, n_real)
+        
         message = self.linear(message) / self.avg_num_neighbors
+        
         return (
             self.reshape(message),
             sc,
