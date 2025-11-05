@@ -4,7 +4,7 @@
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
 
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union,  Tuple
 
 import numpy as np
 import torch
@@ -37,7 +37,17 @@ from .utils import (
 
 import time
 from torch.profiler import profile, record_function, ProfilerActivity
-# pylint: disable=C0302
+
+# for cudaMACE
+from math import sqrt
+from copy import deepcopy
+import cuda_mace.ops
+from cuda_mace.ops.invariant_message_passing import InvariantMessagePassingTP
+from cuda_mace.ops.linear import Linear, ElementalLinear
+from cuda_mace.ops.cubic_spline import CubicSpline
+from cuda_mace.ops.symmetric_contraction import SymmetricContraction as CUDAContraction
+from mace.tools.utils import LAMMPS_MP
+
 
 
 @compile_mode("script")
@@ -335,6 +345,7 @@ class MACE(torch.nn.Module):
         }
 
 
+# ================= ScaleShiftMACE Original Implementation =================#
 @compile_mode("script")
 class ScaleShiftMACE(MACE):
     def __init__(
@@ -361,22 +372,6 @@ class ScaleShiftMACE(MACE):
         compute_atomic_stresses: bool = False,
         lammps_mliap: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
-        
-        '''
-        activities = [
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
-
-        prof = profile(
-            activities=activities,
-            record_shapes=True,
-            with_stack=True,
-        )
-
-        prof.start()
-        prof.step()
-        '''
 
         # Setup
         ctx = prepare_graph(
@@ -399,11 +394,10 @@ class ScaleShiftMACE(MACE):
         interaction_kwargs = ctx.interaction_kwargs
         lammps_natoms = interaction_kwargs.lammps_natoms
         lammps_class = interaction_kwargs.lammps_class
-        
+
         torch.cuda.synchronize()
         forward_start_time = time.perf_counter() * 1000
-        start_time = time.perf_counter() * 1000
-
+        
         # Atomic energies
         node_e0 = self.atomic_energies_fn(data["node_attrs"])[
             num_atoms_arange, node_heads
@@ -411,18 +405,25 @@ class ScaleShiftMACE(MACE):
         e0 = scatter_sum(
             src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
         )  # [n_graphs, num_heads]
+        
 
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         edge_attrs = self.spherical_harmonics(vectors)
-        edge_feats = self.radial_embedding(
-            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
-        )
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"========= embedding cost: {execution_time_ms:.3f} ms ========")
+        print(f"========= embedding spherical_harmonics cost: {execution_time_ms:.3f} ms ========")
+        print(f"embedding vectors dtype: {vectors.dtype}, edge_attrs dtype: {edge_attrs.dtype}")
+
+        edge_feats = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
 
         if hasattr(self, "pair_repulsion"):
             pair_node_energy = self.pair_repulsion_fn(
@@ -443,7 +444,7 @@ class ScaleShiftMACE(MACE):
             node_attrs_slice = data["node_attrs"]
             if is_lammps and i > 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
-            
+
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000
 
@@ -537,11 +538,545 @@ class ScaleShiftMACE(MACE):
                 cell=cell,
             )
 
+        
+        return {
+            "energy": total_energy,
+            "node_energy": node_energy,
+            "interaction_energy": inter_e,
+            "forces": forces,
+            "edge_forces": edge_forces,
+            "virials": virials,
+            "stress": stress,
+            "atomic_virials": atomic_virials,
+            "atomic_stresses": atomic_stresses,
+            "hessian": hessian,
+            "displacement": displacement,
+            "node_feats": node_feats_out,
+        }
+
+# ================ ScaleShiftMACE cudaMACE Implementation =================#
+
+def handle_lammps(
+    node_feats: torch.Tensor,
+    lammps_class: Optional[Any],
+    lammps_natoms: Tuple[int, int],
+    first_layer: bool,
+) -> torch.Tensor:  # noqa: D401 – internal helper
+    if lammps_class is None or first_layer or torch.jit.is_scripting():
+        return node_feats
+    _, n_total = lammps_natoms
+    pad = torch.zeros(
+        (n_total, node_feats.shape[1]),
+        dtype=node_feats.dtype,
+        device=node_feats.device,
+    )
+    node_feats = torch.cat((node_feats, pad), dim=0)
+    node_feats = LAMMPS_MP.apply(node_feats, lammps_class)
+    return node_feats
+
+class SymmetricContractionWrapper(torch.nn.Module):
+    def __init__(self, symmetric_contractions, dtype=torch.float64):
+        super().__init__()
+        self.symmetric_contractions = symmetric_contractions
+
+    def forward(self, x, y):
+        print(f"SymmetricContraction x dtype: {x.dtype}, y dtype: {y.dtype}")
+        y = y.argmax(dim=-1).int()
+        out = self.symmetric_contractions(x, y).squeeze()
+        return out
+
+
+class linear_matmul(torch.nn.Module):
+    def __init__(self, linear_e3nn):
+        super().__init__()
+        num_channels_in = linear_e3nn.__dict__["irreps_in"].num_irreps
+        num_channels_out = linear_e3nn.__dict__["irreps_out"].num_irreps
+        self.weights = (
+            linear_e3nn.weight.data.reshape(num_channels_in, num_channels_out)
+            / num_channels_in**0.5
+        )
+
+    def forward(self, x):
+        print(f"self.weights dtype: {self.weights.dtype}, x dtype: {x.dtype}")
+        if (self.weights.dtype != x.dtype):
+            x = x.to(self.weights.dtype)
+        self.weights = self.weights.to(x.device)
+        return torch.matmul(x, self.weights)
+
+
+def element_linear_to_cuda(skip_tp):
+    # print("elementlinear", skip_tp)
+    num_elements = skip_tp.__dict__["irreps_in2"].dim
+    n_channels = skip_tp.__dict__["irreps_in1"][0].dim
+    lmax = skip_tp.__dict__["irreps_in1"].lmax
+    ws = skip_tp.weight.data.reshape(
+        [lmax + 1, n_channels, num_elements, n_channels]
+    ).permute(2, 0, 1, 3)
+    ws = ws.flatten(1) / sqrt(num_elements)
+    linear_instructions = o3.Linear(
+        skip_tp.__dict__["irreps_in1"], skip_tp.__dict__["irreps_out"]
+    )
+    return ElementalLinear(
+        skip_tp.__dict__["irreps_in1"],
+        skip_tp.__dict__["irreps_out"],
+        linear_instructions.instructions,
+        ws,
+        num_elements,
+    )
+
+
+class InvariantInteraction(torch.nn.Module):
+
+    def __init__(self, mace_model, use_fp32: bool = False):
+        super().__init__()
+        if use_fp32:
+            self.linear_up = linear_matmul(
+                mace_model.interactions[0].linear_up.float())
+            self.linear = Linear(
+                mace_model.interactions[0].linear.float())
+            self.tp = InvariantMessagePassingTP()
+            self.skip_tp = element_linear_to_cuda(
+                mace_model.interactions[0].skip_tp.float())
+        else:
+            self.linear_up = linear_matmul(
+                mace_model.interactions[0].linear_up.double())
+            self.linear = Linear(
+                mace_model.interactions[0].linear.float())
+            self.tp = InvariantMessagePassingTP()
+            self.skip_tp = element_linear_to_cuda(
+                mace_model.interactions[0].skip_tp.double())
+        self.avg_num_neighbors = mace_model.interactions[0].avg_num_neighbors
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        lammps_natoms: Tuple[int, int] = (0, 0),
+        lammps_class: Optional[Any] = None,
+        first_layer: bool = False,
+    ) -> Tuple[torch.Tensor, None]:
+
+        sender = edge_index[1]
+        receiver = edge_index[0]
+        num_nodes = torch.tensor(node_feats.shape[0])
+        n_real = lammps_natoms[0] if lammps_class is not None else None
+
+        node_feats = self.linear_up(node_feats)
+
+        node_feats = handle_lammps(
+            node_feats=node_feats,
+            lammps_class=lammps_class,
+            lammps_natoms=lammps_natoms,
+            first_layer=first_layer,
+        )        
+        print(f"node_feats.shape: {node_feats.shape}, edege_feats.shape: {edge_feats.shape}")
+        message = self.tp.forward(
+            node_feats,
+            edge_attrs,
+            edge_feats.view(edge_feats.shape[0], -1, node_feats.shape[-1]),
+            sender.int(),
+            receiver.int(),
+            num_nodes,
+        )
+        message = message.float()
+        message = self.linear(message) / self.avg_num_neighbors
+        message = self.skip_tp(message, node_attrs)
+
+        return (
+            message,
+            None,
+        )
+
+
+class InvariantResidualInteraction(torch.nn.Module):
+
+    def __init__(self, mace_model, use_fp32: bool = True):
+        super().__init__()
+        if use_fp32:
+            self.linear_up = linear_matmul(
+                mace_model.interactions[1].linear_up.float())
+            self.linear = Linear(mace_model.interactions[1].linear.float())
+            self.skip_tp = mace_model.interactions[1].skip_tp.float()
+        else:
+            self.linear_up = linear_matmul(
+                mace_model.interactions[1].linear_up.double())
+            self.linear = Linear(mace_model.interactions[1].linear.float())
+            self.skip_tp = mace_model.interactions[1].skip_tp.double()
+        
+        self.tp = InvariantMessagePassingTP()
+        
+        self.avg_num_neighbors = mace_model.interactions[1].avg_num_neighbors
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        edge_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        lammps_class: Optional[Any] = None,
+        lammps_natoms: Tuple[int, int] = (0, 0),
+        first_layer: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        sender = edge_index[1]
+        receiver = edge_index[0]
+        num_nodes = torch.tensor(node_feats.shape[0])
+
+        sc = self.skip_tp(node_feats, node_attrs)
+        node_feats = self.linear_up(node_feats)
+        
+        node_feats = handle_lammps(
+            node_feats=node_feats,
+            lammps_class=lammps_class,
+            lammps_natoms=lammps_natoms,
+            first_layer=first_layer,
+        )
+
+        message = self.tp.forward(
+            node_feats,
+            edge_attrs,
+            edge_feats.view(edge_feats.shape[0], -1, node_feats.shape[-1]),
+            sender.int(),
+            receiver.int(),
+            num_nodes,
+        )
+        message = message.float()
+        message = self.linear(message) / self.avg_num_neighbors
+
+        return (
+            message,
+            sc,
+        )
+
+class OptimizedScaleShiftMACE(torch.nn.Module):
+    def __init__(
+        self,
+        mace_model: torch.nn.Module,
+        use_fp32: bool = False,
+    ):
+        super().__init__()
+        self.register_buffer(
+            "atomic_numbers", deepcopy(mace_model.atomic_numbers)
+        )
+        self.register_buffer(
+            "r_max", deepcopy(mace_model.r_max)
+        )
+        self.register_buffer(
+            "num_interactions", deepcopy(mace_model.num_interactions)
+        )
+
+        self.node_embedding = deepcopy(mace_model.node_embedding)
+        self.radial_embedding = deepcopy(mace_model.radial_embedding)
+
+        self.spherical_harmonics = torch.classes.spherical_harmonics.SphericalHarmonics()
+
+        # Interactions and readout
+        self.atomic_energies_fn = deepcopy(mace_model.atomic_energies_fn)
+
+        self.interactions = torch.nn.ModuleList([InvariantInteraction(
+            mace_model, use_fp32), InvariantResidualInteraction(mace_model, use_fp32)])
+        self.products = deepcopy(mace_model.products)
+
+        self.readouts = mace_model.readouts.to(torch.float64)
+
+        self.use_fp32 = use_fp32
+
+        for i in range(mace_model.num_interactions):
+            symm_contract = mace_model.products[i].symmetric_contractions
+            all_weights = {}
+            for j in range(len(symm_contract.contractions)):
+                all_weights[str(j)] = {}
+                if self.use_fp32:
+                    all_weights[str(j)][3] = (
+                        symm_contract.contractions[j].weights_max.detach(
+                        ).clone().type(torch.float32)
+                    )
+                    all_weights[str(j)][2] = (
+                        symm_contract.contractions[j].weights[0].detach(
+                        ).clone().type(torch.float32)
+                    )
+                    all_weights[str(j)][1] = (
+                        symm_contract.contractions[j].weights[1].detach(
+                        ).clone().type(torch.float32)
+                    )
+                else:
+                    all_weights[str(j)][3] = (
+                        symm_contract.contractions[j].weights_max.detach(
+                        ).clone().type(torch.float64)
+                    )
+                    all_weights[str(j)][2] = (
+                        symm_contract.contractions[j].weights[0].detach(
+                        ).clone().type(torch.float64)
+                    )
+                    all_weights[str(j)][1] = (
+                        symm_contract.contractions[j].weights[1].detach(
+                        ).clone().type(torch.float64)
+                    )
+            
+            symmetric_contractions = CUDAContraction(
+                mace_model.products[i].symmetric_contractions, dtype=torch.float32 if self.use_fp32 else torch.float64
+            )
+
+            self.products[i].symmetric_contractions = SymmetricContractionWrapper(
+                symmetric_contractions
+            )
+            if self.use_fp32:
+                self.products[i].linear = linear_matmul(
+                    deepcopy(mace_model.products[i].linear.float()))
+            else:
+                self.products[i].linear = linear_matmul(
+                    deepcopy(mace_model.products[i].linear.double()))
+
+        r, h = np.linspace(1e-12, self.r_max.item() + 1.0, 256, retstep=True)
+        r = torch.tensor(r, dtype=torch.float64).to("cuda")
+        bessel_j = self.radial_embedding(r.unsqueeze(-1), None, None, None)
+
+        if isinstance(bessel_j, tuple):
+            bessel_j = bessel_j[0]
+        
+        edge_splines = []
+        for i, interaction in enumerate(mace_model.interactions):
+            R = interaction.conv_tp_weights(bessel_j)
+            if self.use_fp32:
+                spline = CubicSpline(
+                    r.cuda().float(), R.cuda().float(), h, self.r_max.item())
+            else:
+                spline = CubicSpline(
+                    r.cuda().double(), R.cuda().double(), h, self.r_max.item())
+            edge_splines.append(spline)
+
+        self.edge_splines = torch.nn.ModuleList(edge_splines)
+
+        self.scale_shift = deepcopy(mace_model.scale_shift.double())
+
+        self.orig_model = mace_model
+
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        compute_edge_forces: bool = False,
+        compute_atomic_stresses: bool = False,
+        lammps_mliap: bool = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+
+        # Setup
+        ctx = prepare_graph(
+            data,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_displacement=compute_displacement,
+            lammps_mliap=lammps_mliap,
+        )
+
+        is_lammps = ctx.is_lammps
+        num_atoms_arange = ctx.num_atoms_arange
+        num_graphs = ctx.num_graphs
+        displacement = ctx.displacement
+        positions = ctx.positions
+        vectors = ctx.vectors
+        lengths = ctx.lengths
+        cell = ctx.cell
+        node_heads = ctx.node_heads
+        interaction_kwargs = ctx.interaction_kwargs
+        lammps_natoms = interaction_kwargs.lammps_natoms
+        lammps_class = interaction_kwargs.lammps_class
+
+        data["positions"].requires_grad_(True)
+        data["node_attrs"].requires_grad_(True)
+
+        torch.cuda.synchronize()
+        forward_start_time = time.perf_counter() * 1000
+        
+        # Atomic energies
+        node_e0 = self.atomic_energies_fn(data["node_attrs"])[
+            num_atoms_arange, node_heads
+        ]
+        e0 = scatter_sum(
+            src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
+        )  # [n_graphs, num_heads]
+
+        # Embeddings
+        node_feats = self.node_embedding(data["node_attrs"])
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        edge_attrs = self.spherical_harmonics.forward(vectors)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= embedding spherical_harmonics cost: {execution_time_ms:.3f} ms ========")
+        print(f"embedding vectors dtype: {vectors.dtype}, edge_attrs dtype: {edge_attrs.dtype}")
+
         '''
-        prof.stop()
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        if self.use_fp32:
+            edge_feats = self.radial_embedding(
+                lengths.float(), data["node_attrs"].float(), data["edge_index"].float(), self.atomic_numbers
+            ).float()
+        else:
+            edge_feats = self.radial_embedding(
+                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+            )
+        
+        print(f"edge_feats.shape: {edge_feats.shape}, lengths.shape: {lengths.shape}, node_attrs.shape: {data['node_attrs'].shape}, edge_index.shape: {data['edge_index'].shape}")
         '''
+
+        if hasattr(self, "pair_repulsion"):
+            pair_node_energy = self.pair_repulsion_fn(
+                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+            )
+            if is_lammps:
+                pair_node_energy = pair_node_energy[: lammps_natoms[0]]
+        else:
+            pair_node_energy = torch.zeros_like(node_e0)
+        
+        # Interactions
+        node_es_list = [pair_node_energy]
+        node_feats_list: List[torch.Tensor] = []
+
+        for i, (interaction, product, readout, edge_spline) in enumerate(
+            zip(self.interactions, self.products, self.readouts, self.edge_splines)
+        ):
+            node_attrs_slice = data["node_attrs"]
+            if is_lammps and i > 0:
+                node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            if (len(lengths.shape) == 2):
+                lengths = lengths.squeeze(-1)
+
+            if (lengths.dtype != torch.float64):
+                lengths = lengths.double()
+
+            if self.use_fp32:
+                edge_feats = edge_spline.forward(lengths.float())
+            else:
+                edge_feats = edge_spline.forward(lengths.double())
+            
+            print(f"edge_feats.shape after spline: {edge_feats.shape}, lengths.shape: {lengths.shape}")
+
+            if self.use_fp32:
+                node_feats, sc = interaction(
+                    node_attrs=node_attrs_slice.float(),
+                    node_feats=node_feats.float(),
+                    edge_attrs=edge_attrsf.float(),
+                    edge_feats=edge_feats.float(),
+                    edge_index=data["edge_index"],
+                    first_layer=(i == 0),
+                    lammps_class=lammps_class,
+                    lammps_natoms=lammps_natoms,
+                )
+            else:
+                node_feats, sc = interaction(
+                    node_attrs=node_attrs_slice,
+                    node_feats=node_feats,
+                    edge_attrs=edge_attrs,
+                    edge_feats=edge_feats,
+                    edge_index=data["edge_index"],
+                    first_layer=(i == 0),
+                    lammps_class=lammps_class,
+                    lammps_natoms=lammps_natoms,
+                )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= interaction cost: {execution_time_ms:.3f} ms ========")
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            if is_lammps and i == 0:
+                node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            
+            if self.use_fp32:   
+                node_feats = product(
+                    node_feats=node_feats.float(), sc=sc, node_attrs=node_attrs_slice.float()
+                )
+            else:
+                node_feats = product(
+                    node_feats=node_feats.double(), sc=sc, node_attrs=node_attrs_slice
+                )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= product cost: {execution_time_ms:.3f} ms ========")
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            node_feats_list.append(node_feats)
+            node_es_list.append(
+                readout(node_feats, node_heads)[num_atoms_arange, node_heads]
+            )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= readout cost: {execution_time_ms:.3f} ms ========")
+
+        node_feats_out = torch.cat(node_feats_list, dim=-1)
+        node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)
+        node_inter_es = self.scale_shift(node_inter_es, node_heads)
+        inter_e = scatter_sum(node_inter_es, data["batch"], dim=-1, dim_size=num_graphs)
+
+        total_energy = e0 + inter_e
+        node_energy = node_e0.clone().double() + node_inter_es.clone().double()
+
+        torch.cuda.synchronize()
+        forward_end_time = time.perf_counter() * 1000
+        execution_time_ms = forward_end_time - forward_start_time
+        print(f"========= {node_heads.shape[0]} forward cost: {execution_time_ms:.3f} ms ========")
+
+        torch.cuda.synchronize()
+        backward_start_time = time.perf_counter() * 1000
+
+        forces, virials, stress, hessian, edge_forces = get_outputs(
+            energy=inter_e,
+            positions=positions,
+            displacement=displacement,
+            vectors=vectors,
+            cell=cell,
+            training=training,
+            compute_force=compute_force,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_hessian=compute_hessian,
+            compute_edge_forces=compute_edge_forces or compute_atomic_stresses,
+        )
+
+        torch.cuda.synchronize()
+        backward_end_time = time.perf_counter() * 1000
+        execution_time_ms = backward_end_time - backward_start_time
+        print(f"========= Batch: {node_heads.shape[0]}, backward cost: {execution_time_ms:.3f} ms ========")
+
+        atomic_virials: Optional[torch.Tensor] = None
+        atomic_stresses: Optional[torch.Tensor] = None
+        if compute_atomic_stresses and edge_forces is not None:
+            atomic_virials, atomic_stresses = get_atomic_virials_stresses(
+                edge_forces=edge_forces,
+                edge_index=data["edge_index"],
+                vectors=vectors,
+                num_atoms=positions.shape[0],
+                batch=data["batch"],
+                cell=cell,
+            )
+
         return {
             "energy": total_energy,
             "node_energy": node_energy,

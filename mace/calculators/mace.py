@@ -37,6 +37,8 @@ from mace.tools import (
 import time
 from tqdm import tqdm
 
+from mace.modules import OptimizedScaleShiftMACE
+
 # Import graph construction kernels
 
 
@@ -198,6 +200,11 @@ class MACECalculator(Calculator):
         # Ensure all models are on the same device
         for model in self.models:
             model.to(device)
+        
+        
+        for i in range(len(self.models)):
+            print("<<<<<<<<<<<< Convert to OptimizedScaleShiftMACE >>>>>>>>>>>>>>")
+            self.models[i] = OptimizedScaleShiftMACE(self.models[i])
 
         r_maxs = [model.r_max.cpu() for model in self.models]
         r_maxs = np.array(r_maxs)
