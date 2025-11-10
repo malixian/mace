@@ -82,11 +82,14 @@ class MACECalculator(Calculator):
         fullgraph=True,
         enable_cueq=False,
         use_batch_size=1,
+        use_cumace=False,
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
         self.device = device
         self.dtype=None
+        if use_cumace:
+            enable_cueq=False
         if enable_cueq:
             assert model_type == "MACE", "CuEq only supports MACE models"
             compile_mode = None
@@ -201,10 +204,10 @@ class MACECalculator(Calculator):
         for model in self.models:
             model.to(device)
         
-        
-        for i in range(len(self.models)):
-            print("<<<<<<<<<<<< Convert to OptimizedScaleShiftMACE >>>>>>>>>>>>>>")
-            self.models[i] = OptimizedScaleShiftMACE(self.models[i])
+        if use_cumace:
+            for i in range(len(self.models)):
+                print("<<<<<<<<<<<< Convert to OptimizedScaleShiftMACE >>>>>>>>>>>>>>")
+                self.models[i] = OptimizedScaleShiftMACE(self.models[i], use_fp32=False)
 
         r_maxs = [model.r_max.cpu() for model in self.models]
         r_maxs = np.array(r_maxs)
