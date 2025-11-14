@@ -33,7 +33,79 @@ from .radial import (
     SoftTransform,
 )
 
-import time
+from cuda_mace.ops.invariant_message_passing import InvariantMessagePassingTP
+from cuequivariance_torch.primitives.utils import make_FastFusedMessagePassing
+
+import time, os
+
+'''
+from torch.utils.cpp_extension import load
+torch.set_printoptions(precision=4, sci_mode=False)
+os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+
+fused_mp_fwd = load(
+    name="fused_mp",
+    sources=["/home/malixian/repos/cuequivariance_torch/my_test/channle_wise_tensor_product/fused_message_passing_opt.cu"],  # 路径按你的实际放置
+    extra_cuda_cflags=["-O3", "--use_fast_math", '-gencode=arch=compute_90,code=sm_90', '--ptxas-options=-v', "-Xptxas --maxrregcount=128"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
+
+fused_mp_bwd = load(
+    name="fused_mp_bwd",
+    sources=["/home/malixian/repos/cuequivariance_torch/my_test/channle_wise_tensor_product/fused_message_passing_bwd.cu"],  # 路径按你的实际放置
+    extra_cuda_cflags=["-O3", "--use_fast_math", '-gencode=arch=compute_90,code=sm_90', '--ptxas-options=-v', "-Xptxas --maxrregcount=128"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
+
+
+class FusedMPFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, node_feats, edge_attrs, tp_weights,
+                receiver, start_idx, end_idx, dim_list, offs):
+        # 保存反向所需变量
+        ctx.save_for_backward(node_feats, edge_attrs, tp_weights,
+                              receiver, start_idx, end_idx,
+                              dim_list, offs)
+        out = fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
+                               receiver, start_idx, end_idx,
+                               dim_list, offs, 32, 8)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out_nodes):
+        node_feats, edge_attrs, tp_weights, \
+        receiver, start_idx, end_idx, \
+        dim_list, offs = ctx.saved_tensors
+
+        grad_node_feats, grad_edge_attrs, grad_tp_weights = fused_mp_bwd.backward(
+            grad_out_nodes.contiguous(),
+            node_feats, edge_attrs, tp_weights,
+            receiver, start_idx, end_idx,
+            dim_list, offs,
+        )
+
+        # 对应 forward 的后面几个输入没有梯度的返回 None
+        return (grad_node_feats,
+                grad_edge_attrs,
+                grad_tp_weights,
+                None,  # receiver
+                None,  # start_idx
+                None,  # end_idx
+                None,  # dim_list
+                None)  # offs
+
+
+def fused_mp_cuda(node_feats, edge_attrs, tp_weights,
+                  receiver, start_idx, end_idx,
+                  dim_list, offs):
+    return FusedMPFunction.apply(
+        node_feats, edge_attrs, tp_weights,
+        receiver, start_idx, end_idx,
+        dim_list, offs
+    )
+'''
 
 @compile_mode("script")
 class LinearNodeEmbeddingBlock(torch.nn.Module):
@@ -294,15 +366,34 @@ class EquivariantProductBasisBlock(torch.nn.Module):
             if use_cueq_mul_ir:
                 node_feats = torch.transpose(node_feats, 1, 2)
             index_attrs = torch.nonzero(node_attrs)[:, 1].int()
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
             node_feats = self.symmetric_contractions(
                 node_feats.flatten(1),
                 index_attrs,
             )
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= EquivariantProductBasisBlock symmetric_contractions cost: {execution_time_ms:.3f} ms ========")
         else:
             node_feats = self.symmetric_contractions(node_feats, node_attrs)
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         if self.use_sc and sc is not None:
-            return self.linear(node_feats) + sc
-        return self.linear(node_feats)
+            out = self.linear(node_feats) + sc
+        else:
+            out = self.linear(node_feats)
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= EquivariantProductBasisBlock linear cost: {execution_time_ms:.3f} ms ========")
+
+        return out
 
 
 @compile_mode("script")
@@ -332,6 +423,8 @@ class InteractionBlock(torch.nn.Module):
         self.radial_MLP = radial_MLP
         self.cueq_config = cueq_config
         self._setup()
+
+        self.fused_mp = make_FastFusedMessagePassing()
 
     @abstractmethod
     def _setup(self) -> None:
@@ -432,6 +525,10 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         )
         self.reshape = reshape_irreps(self.irreps_out, cueq_config=self.cueq_config)
 
+        self.fused_mp = make_FastFusedMessagePassing()
+        self.dim_list_tensor = torch.tensor([1,3,5,7], dtype=torch.int32, device="cuda")
+        self.offs_tensor     = torch.tensor([0,1,4,9], dtype=torch.int32, device="cuda")
+
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -447,8 +544,16 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         receiver = edge_index[1]
         num_nodes = node_feats.shape[0]
         n_real = lammps_natoms[0] if lammps_class is not None else None
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
         node_feats = self.linear_up(node_feats)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace interaction linear_up(Linear) cost: {execution_time_ms:.3f} ms ========")
 
         node_feats = self.handle_lammps(
             node_feats,
@@ -456,22 +561,95 @@ class RealAgnosticInteractionBlock(InteractionBlock):
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
         tp_weights = self.conv_tp_weights(edge_feats)
-            
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace interaction conv_tp_weights(e3nn.nn.FullyConnectedNet) cost: {execution_time_ms:.3f} ms ========")
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        '''
         mji = self.conv_tp(
             node_feats[sender], edge_attrs, tp_weights
         )  # [n_edges, irreps]
+
+        print(f"conv_tp, mji.shape:{mji.shape}, node_feats[sender].shape:{node_feats[sender].shape}, edge_attrs.shape:{edge_attrs.shape}, tp_weights.shape:{tp_weights.shape}")
+        print(f"mji.requires_grad={mji.requires_grad}, node_feats.requires_grad={node_feats.requires_grad}, edge_attrs.requires_grad={edge_attrs.requires_grad}, tp_weights.requires_grad={tp_weights.requires_grad}")
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace interaction conv_tp(ChannelWiseTensorProduct) cost: {execution_time_ms:.3f} ms ========")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
         message = scatter_sum(
             src=mji, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, irreps]
+
+        print(f"scatter_sum, message.shape:{message.shape}, mij.shape:{mji.shape}, receiver.shape:{receiver.shape}, num_nodes:{num_nodes}")
+        print(f"message.requires_grad:{message.requires_grad}, mij.shrequires_gradape:{mji.requires_grad}, receiver.requires_grad:{receiver.requires_grad}")
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace interaction scatter_sum: {execution_time_ms:.3f} ms ========")
+        '''
+        
+
+        
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
+        message = self.fused_mp.apply(node_feats, edge_attrs, tp_weights, sender, receiver, self.dim_list_tensor, self.offs_tensor)
+        
+        '''
+        tp_weights_reshaped = tp_weights.view(tp_weights.shape[0], 4, -1)
+
+        start_idx, end_idx = fused_mp_fwd.compute_sender_runs_sorted(sender, num_nodes)
+        message_diy = fused_mp_cuda(node_feats, edge_attrs, tp_weights_reshaped,
+                           receiver.int(), start_idx, end_idx,
+                           self.dim_list_tensor, self.offs_tensor)
+        message = message_diy.view(message_diy.shape[0], -1)
+        '''
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= my fused message passing cost: {execution_time_ms:.3f} ms ========")
+
+
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
 
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         message = self.linear(message) / self.avg_num_neighbors
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace interaction linear(Linear) cost: {execution_time_ms:.3f} ms ========")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
         message = self.skip_tp(message, node_attrs)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace interaction skip_tp(FullyConnectedTensorProduct) cost: {execution_time_ms:.3f} ms ========")
 
         return (
             self.reshape(message),
@@ -534,6 +712,10 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         )
         self.reshape = reshape_irreps(self.irreps_out, cueq_config=self.cueq_config)
 
+        self.fused_mp = make_FastFusedMessagePassing()
+        self.dim_list_tensor = torch.tensor([1,3,5,7], dtype=torch.int32, device="cuda")
+        self.offs_tensor     = torch.tensor([0,1,4,9], dtype=torch.int32, device="cuda")
+
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -550,9 +732,25 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         num_nodes = node_feats.shape[0]
         n_real = lammps_natoms[0] if lammps_class is not None else None
         
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
         sc = self.skip_tp(node_feats, node_attrs)
 
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace residual interaction skip_tp(FullyConnectedTensorProduct) cost: {execution_time_ms:.3f} ms ========")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
         node_feats = self.linear_up(node_feats)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace residual interaction linear_up(Linear) cost: {execution_time_ms:.3f} ms ========")
 
         node_feats = self.handle_lammps(
             node_feats,
@@ -561,20 +759,76 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
             first_layer=first_layer,
         )
         
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         tp_weights = self.conv_tp_weights(edge_feats)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace residual interaction conv_tp_weights(e3nn.nn.FullyConnectedNet) cost: {execution_time_ms:.3f} ms ========")
         
+        '''
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         mji = self.conv_tp(
             node_feats[sender], edge_attrs, tp_weights
         )  # [n_edges, irreps]
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace residual interaction conv_tp(ChannelWiseTensorProduct) cost: {execution_time_ms:.3f} ms ========")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
         message = scatter_sum(
             src=mji, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, irreps]
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace residual interaction scatter_sum cost: {execution_time_ms:.3f} ms ========")
+        '''
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        message = self.fused_mp.apply(node_feats, edge_attrs, tp_weights, sender, receiver, self.dim_list_tensor, self.offs_tensor)
+
+        '''
+        tp_weights_reshaped = tp_weights.view(tp_weights.shape[0], 4, -1)
+
+        start_idx, end_idx = fused_mp_fwd.compute_sender_runs_sorted(sender, num_nodes)
+        message_diy = fused_mp_cuda(node_feats, edge_attrs, tp_weights_reshaped,
+                           receiver.int(), start_idx, end_idx,
+                           self.dim_list_tensor, self.offs_tensor)
+        message = message_diy.view(message_diy.shape[0], -1)
+        '''
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= my fused message passing cost: {execution_time_ms:.3f} ms ========")
+
+
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
         sc = self.truncate_ghosts(sc, n_real)
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
         message = self.linear(message) / self.avg_num_neighbors
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= mace residual interaction linear(Linear) cost: {execution_time_ms:.3f} ms ========")
         
         return (
             self.reshape(message),

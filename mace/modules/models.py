@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Type, Union,  Tuple
 
 import numpy as np
 import torch
-from e3nn import o3
+from e3nn import nn, o3
 from e3nn.util.jit import compile_mode
 
 from mace.modules.radial import ZBLBasis
@@ -415,12 +415,6 @@ class ScaleShiftMACE(MACE):
 
         edge_attrs = self.spherical_harmonics(vectors)
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"========= embedding spherical_harmonics cost: {execution_time_ms:.3f} ms ========")
-        print(f"embedding vectors dtype: {vectors.dtype}, edge_attrs dtype: {edge_attrs.dtype}")
-
         edge_feats = self.radial_embedding(
             lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
         )
@@ -433,6 +427,11 @@ class ScaleShiftMACE(MACE):
                 pair_node_energy = pair_node_energy[: lammps_natoms[0]]
         else:
             pair_node_energy = torch.zeros_like(node_e0)
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= embedding cost: {execution_time_ms:.3f} ms ========")
         
         # Interactions
         node_es_list = [pair_node_energy]
@@ -472,7 +471,7 @@ class ScaleShiftMACE(MACE):
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
-
+            print(f"node_feats shape: {node_feats.shape}")
             torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
@@ -502,7 +501,7 @@ class ScaleShiftMACE(MACE):
         torch.cuda.synchronize()
         forward_end_time = time.perf_counter() * 1000
         execution_time_ms = forward_end_time - forward_start_time
-        print(f"========= {node_heads.shape[0]} forward cost: {execution_time_ms:.3f} ms ========")
+        print(f"========= Batch: {node_heads.shape[0]} forward cost: {execution_time_ms:.3f} ms ========")
 
         torch.cuda.synchronize()
         backward_start_time = time.perf_counter() * 1000
@@ -580,7 +579,6 @@ class SymmetricContractionWrapper(torch.nn.Module):
         self.symmetric_contractions = symmetric_contractions
 
     def forward(self, x, y):
-        print(f"SymmetricContraction x dtype: {x.dtype}, y dtype: {y.dtype}")
         y = y.argmax(dim=-1).int()
         out = self.symmetric_contractions(x, y).squeeze()
         return out
@@ -597,10 +595,10 @@ class linear_matmul(torch.nn.Module):
         )
 
     def forward(self, x):
-        print(f"self.weights dtype: {self.weights.dtype}, x dtype: {x.dtype}")
         if (self.weights.dtype != x.dtype):
             x = x.to(self.weights.dtype)
         self.weights = self.weights.to(x.device)
+        print(f"linear_matmul x shape: {x.shape}, weights shape: {self.weights.shape}")
         return torch.matmul(x, self.weights)
 
 
@@ -661,18 +659,32 @@ class InvariantInteraction(torch.nn.Module):
 
         sender = edge_index[1]
         receiver = edge_index[0]
+
         num_nodes = torch.tensor(node_feats.shape[0])
         n_real = lammps_natoms[0] if lammps_class is not None else None
 
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
         node_feats = self.linear_up(node_feats)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace interaction linear_up(linear_matmul) cost: {execution_time_ms:.3f} ms ========")
 
         node_feats = handle_lammps(
             node_feats=node_feats,
             lammps_class=lammps_class,
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
-        )        
-        print(f"node_feats.shape: {node_feats.shape}, edege_feats.shape: {edge_feats.shape}")
+        )
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        print(f"node_feats.shape:{node_feats.shape}, edge_attrs.shape:{edge_attrs.shape}")
+
         message = self.tp.forward(
             node_feats,
             edge_attrs,
@@ -680,10 +692,31 @@ class InvariantInteraction(torch.nn.Module):
             sender.int(),
             receiver.int(),
             num_nodes,
+        
         )
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace interaction InvariantMessagePassingTP cost: {execution_time_ms:.3f} ms, message.dtype:{message.dtype} ========")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         message = message.float()
         message = self.linear(message) / self.avg_num_neighbors
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace interaction linear(Linear)  cost: {execution_time_ms:.3f} ms ========")
+
         message = self.skip_tp(message, node_attrs)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace interaction skip_tp(element_linear_to_cuda) cost: {execution_time_ms:.3f} ms ========")
 
         return (
             message,
@@ -726,15 +759,35 @@ class InvariantResidualInteraction(torch.nn.Module):
         receiver = edge_index[0]
         num_nodes = torch.tensor(node_feats.shape[0])
 
-        sc = self.skip_tp(node_feats, node_attrs)
-        node_feats = self.linear_up(node_feats)
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
+        sc = self.skip_tp(node_feats, node_attrs)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace residual interaction skip_tp(FullyConnectedTensorProduct) cost: {execution_time_ms:.3f} ms ========")
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        node_feats = self.linear_up(node_feats)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace residual interaction linear_up(linear_matmul) cost: {execution_time_ms:.3f} ms ========")
+
         node_feats = handle_lammps(
             node_feats=node_feats,
             lammps_class=lammps_class,
             lammps_natoms=lammps_natoms,
             first_layer=first_layer,
         )
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
 
         message = self.tp.forward(
             node_feats,
@@ -744,8 +797,22 @@ class InvariantResidualInteraction(torch.nn.Module):
             receiver.int(),
             num_nodes,
         )
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace residual interaction InvariantMessagePassingTP cost: {execution_time_ms:.3f} ms ========")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         message = message.float()
         message = self.linear(message) / self.avg_num_neighbors
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace residual interaction linear(Linear)  cost: {execution_time_ms:.3f} ms ========")
 
         return (
             message,
@@ -914,13 +981,6 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
 
         edge_attrs = self.spherical_harmonics.forward(vectors)
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"========= embedding spherical_harmonics cost: {execution_time_ms:.3f} ms ========")
-        print(f"embedding vectors dtype: {vectors.dtype}, edge_attrs dtype: {edge_attrs.dtype}")
-
-        '''
         if self.use_fp32:
             edge_feats = self.radial_embedding(
                 lengths.float(), data["node_attrs"].float(), data["edge_index"].float(), self.atomic_numbers
@@ -929,9 +989,8 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
             edge_feats = self.radial_embedding(
                 lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
             )
-        
-        print(f"edge_feats.shape: {edge_feats.shape}, lengths.shape: {lengths.shape}, node_attrs.shape: {data['node_attrs'].shape}, edge_index.shape: {data['edge_index'].shape}")
-        '''
+
+        print(f"After radial_embedding, edge_feats.shape:{edge_feats.shape} ")
 
         if hasattr(self, "pair_repulsion"):
             pair_node_energy = self.pair_repulsion_fn(
@@ -941,6 +1000,11 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
                 pair_node_energy = pair_node_energy[: lammps_natoms[0]]
         else:
             pair_node_energy = torch.zeros_like(node_e0)
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= cumace embedding cost: {execution_time_ms:.3f} ms ========")
         
         # Interactions
         node_es_list = [pair_node_energy]
@@ -962,12 +1026,18 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
             if (lengths.dtype != torch.float64):
                 lengths = lengths.double()
 
+            
             if self.use_fp32:
                 edge_feats = edge_spline.forward(lengths.float())
             else:
                 edge_feats = edge_spline.forward(lengths.double())
             
-            print(f"edge_feats.shape after spline: {edge_feats.shape}, lengths.shape: {lengths.shape}")
+            print(f"After edge_spline, edge_feats.shape:{edge_feats.shape} ")
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= cumace edge_spline cost: {execution_time_ms:.3f} ms ========")
 
             if self.use_fp32:
                 node_feats, sc = interaction(
@@ -982,10 +1052,10 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
                 )
             else:
                 node_feats, sc = interaction(
-                    node_attrs=node_attrs_slice,
-                    node_feats=node_feats,
-                    edge_attrs=edge_attrs,
-                    edge_feats=edge_feats,
+                    node_attrs=node_attrs_slice.double(),
+                    node_feats=node_feats.double(),
+                    edge_attrs=edge_attrs.double(),
+                    edge_feats=edge_feats.double(),
                     edge_index=data["edge_index"],
                     first_layer=(i == 0),
                     lammps_class=lammps_class,
@@ -995,7 +1065,7 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
             torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
-            print(f"========= interaction cost: {execution_time_ms:.3f} ms ========")
+            print(f"========= cumace interaction + edge_spline cost: {execution_time_ms:.3f} ms, node_feats.dtype={node_feats.dtype} ========")
 
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000
@@ -1015,7 +1085,7 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
             torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
-            print(f"========= product cost: {execution_time_ms:.3f} ms ========")
+            print(f"========= cumace product cost: {execution_time_ms:.3f} ms, node_feats.dtype: {node_feats.dtype} ========")
             
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000
@@ -1028,7 +1098,7 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
             torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
-            print(f"========= readout cost: {execution_time_ms:.3f} ms ========")
+            print(f"========= cumace readout cost: {execution_time_ms:.3f} ms ========")
 
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)
@@ -1041,7 +1111,7 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
         torch.cuda.synchronize()
         forward_end_time = time.perf_counter() * 1000
         execution_time_ms = forward_end_time - forward_start_time
-        print(f"========= {node_heads.shape[0]} forward cost: {execution_time_ms:.3f} ms ========")
+        print(f"========= cumace Batch: {node_heads.shape[0]} forward cost: {execution_time_ms:.3f} ms ========")
 
         torch.cuda.synchronize()
         backward_start_time = time.perf_counter() * 1000
@@ -1063,7 +1133,7 @@ class OptimizedScaleShiftMACE(torch.nn.Module):
         torch.cuda.synchronize()
         backward_end_time = time.perf_counter() * 1000
         execution_time_ms = backward_end_time - backward_start_time
-        print(f"========= Batch: {node_heads.shape[0]}, backward cost: {execution_time_ms:.3f} ms ========")
+        print(f"========= cumace Batch: {node_heads.shape[0]}, backward cost: {execution_time_ms:.3f} ms ========")
 
         atomic_virials: Optional[torch.Tensor] = None
         atomic_stresses: Optional[torch.Tensor] = None

@@ -47,6 +47,22 @@ class CuEquivarianceConfig:
             self.enabled = False
 
 
+class LinearMatmul(torch.nn.Module):
+    def __init__(self, linear_e3nn):
+        super().__init__()
+        num_channels_in = linear_e3nn.__dict__["irreps_in"].num_irreps
+        num_channels_out = linear_e3nn.__dict__["irreps_out"].num_irreps
+        self.weights = (
+            linear_e3nn.weight.data.reshape(num_channels_in, num_channels_out)
+            / num_channels_in**0.5
+        )
+
+    def forward(self, x):
+        if (self.weights.dtype != x.dtype):
+            x = x.to(self.weights.dtype)
+        self.weights = self.weights.to(x.device)
+        return torch.matmul(x, self.weights)
+
 class Linear:
     """Returns either a cuet.Linear or o3.Linear based on config"""
 
