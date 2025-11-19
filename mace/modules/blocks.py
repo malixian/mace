@@ -36,76 +36,9 @@ from .radial import (
 from cuda_mace.ops.invariant_message_passing import InvariantMessagePassingTP
 from cuequivariance_torch.primitives.utils import make_FastFusedMessagePassing
 
+import flashTP_e3nn
+
 import time, os
-
-'''
-from torch.utils.cpp_extension import load
-torch.set_printoptions(precision=4, sci_mode=False)
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
-
-fused_mp_fwd = load(
-    name="fused_mp",
-    sources=["/home/malixian/repos/cuequivariance_torch/my_test/channle_wise_tensor_product/fused_message_passing_opt.cu"],  # 路径按你的实际放置
-    extra_cuda_cflags=["-O3", "--use_fast_math", '-gencode=arch=compute_90,code=sm_90', '--ptxas-options=-v', "-Xptxas --maxrregcount=128"],
-    extra_cflags=["-O3"],
-    verbose=False,
-)
-
-fused_mp_bwd = load(
-    name="fused_mp_bwd",
-    sources=["/home/malixian/repos/cuequivariance_torch/my_test/channle_wise_tensor_product/fused_message_passing_bwd.cu"],  # 路径按你的实际放置
-    extra_cuda_cflags=["-O3", "--use_fast_math", '-gencode=arch=compute_90,code=sm_90', '--ptxas-options=-v', "-Xptxas --maxrregcount=128"],
-    extra_cflags=["-O3"],
-    verbose=False,
-)
-
-
-class FusedMPFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, node_feats, edge_attrs, tp_weights,
-                receiver, start_idx, end_idx, dim_list, offs):
-        # 保存反向所需变量
-        ctx.save_for_backward(node_feats, edge_attrs, tp_weights,
-                              receiver, start_idx, end_idx,
-                              dim_list, offs)
-        out = fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
-                               receiver, start_idx, end_idx,
-                               dim_list, offs, 32, 8)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out_nodes):
-        node_feats, edge_attrs, tp_weights, \
-        receiver, start_idx, end_idx, \
-        dim_list, offs = ctx.saved_tensors
-
-        grad_node_feats, grad_edge_attrs, grad_tp_weights = fused_mp_bwd.backward(
-            grad_out_nodes.contiguous(),
-            node_feats, edge_attrs, tp_weights,
-            receiver, start_idx, end_idx,
-            dim_list, offs,
-        )
-
-        # 对应 forward 的后面几个输入没有梯度的返回 None
-        return (grad_node_feats,
-                grad_edge_attrs,
-                grad_tp_weights,
-                None,  # receiver
-                None,  # start_idx
-                None,  # end_idx
-                None,  # dim_list
-                None)  # offs
-
-
-def fused_mp_cuda(node_feats, edge_attrs, tp_weights,
-                  receiver, start_idx, end_idx,
-                  dim_list, offs):
-    return FusedMPFunction.apply(
-        node_feats, edge_attrs, tp_weights,
-        receiver, start_idx, end_idx,
-        dim_list, offs
-    )
-'''
 
 @compile_mode("script")
 class LinearNodeEmbeddingBlock(torch.nn.Module):
@@ -529,6 +462,16 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         self.dim_list_tensor = torch.tensor([1,3,5,7], dtype=torch.int32, device="cuda")
         self.offs_tensor     = torch.tensor([0,1,4,9], dtype=torch.int32, device="cuda")
 
+        used_dtype = torch.float64
+        self.flashtp = flashTP_e3nn.uvu_TP(
+            self.node_feats_irreps,
+            self.edge_attrs_irreps,
+            irreps_mid,
+            instructions,
+            device="cuda", 
+            dtype=used_dtype
+        )
+
     def forward(
         self,
         node_attrs: torch.Tensor,
@@ -572,62 +515,65 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         execution_time_ms = end_time - start_time
         print(f"========= mace interaction conv_tp_weights(e3nn.nn.FullyConnectedNet) cost: {execution_time_ms:.3f} ms ========")
         
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-
+        
         '''
+        # ============= original implementaion =============
         mji = self.conv_tp(
             node_feats[sender], edge_attrs, tp_weights
         )  # [n_edges, irreps]
-
-        print(f"conv_tp, mji.shape:{mji.shape}, node_feats[sender].shape:{node_feats[sender].shape}, edge_attrs.shape:{edge_attrs.shape}, tp_weights.shape:{tp_weights.shape}")
-        print(f"mji.requires_grad={mji.requires_grad}, node_feats.requires_grad={node_feats.requires_grad}, edge_attrs.requires_grad={edge_attrs.requires_grad}, tp_weights.requires_grad={tp_weights.requires_grad}")
-
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"========= mace interaction conv_tp(ChannelWiseTensorProduct) cost: {execution_time_ms:.3f} ms ========")
-
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
         
         message = scatter_sum(
             src=mji, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, irreps]
+        # =================================================
+        '''
+        
+        # ============= receiver major fasteq =============
 
-        print(f"scatter_sum, message.shape:{message.shape}, mij.shape:{mji.shape}, receiver.shape:{receiver.shape}, num_nodes:{num_nodes}")
-        print(f"message.requires_grad:{message.requires_grad}, mij.shrequires_gradape:{mji.requires_grad}, receiver.requires_grad:{receiver.requires_grad}")
+        # 1. 按 receiver 升序排序，得到 permutation
+        receiver_sorted, perm = torch.sort(receiver) 
+        # 2. 用 perm 重排所有按 edge 存储的张量
+        sender_sorted     = sender[perm]
+        edge_attrs_sorted = edge_attrs[perm]      # [E, DIM_SUM]
+        tp_weights_sorted = tp_weights[perm]      # [E, P, U]
+
+        print(f"receiver sorted: {receiver_sorted}")
+        print(f"sender: {sender_sorted}")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        
+        message = self.fused_mp.apply(node_feats, edge_attrs_sorted, tp_weights_sorted, sender_sorted, receiver_sorted, self.dim_list_tensor, self.offs_tensor)
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"========= mace interaction scatter_sum: {execution_time_ms:.3f} ms ========")
-        '''
-        
+        print(f"========= receiver major fused message passing cost: {execution_time_ms:.3f} ms ========")
 
-        
-        
+        # =================================================
+ 
+
+        # ============= sender major fasteq =============
+        '''
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
         
+        # Test Fasteq
         message = self.fused_mp.apply(node_feats, edge_attrs, tp_weights, sender, receiver, self.dim_list_tensor, self.offs_tensor)
-        
-        '''
-        tp_weights_reshaped = tp_weights.view(tp_weights.shape[0], 4, -1)
-
-        start_idx, end_idx = fused_mp_fwd.compute_sender_runs_sorted(sender, num_nodes)
-        message_diy = fused_mp_cuda(node_feats, edge_attrs, tp_weights_reshaped,
-                           receiver.int(), start_idx, end_idx,
-                           self.dim_list_tensor, self.offs_tensor)
-        message = message_diy.view(message_diy.shape[0], -1)
-        '''
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"========= my fused message passing cost: {execution_time_ms:.3f} ms ========")
-
-
+        '''
+        # =================================================
+        
+        '''
+        # Test FlashTP
+        # message = self.flashtp(node_feats, edge_attrs, tp_weights, sender.int(), receiver.int())
+        '''
+        
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
 
@@ -686,6 +632,8 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
             cueq_config=self.cueq_config,
         )
 
+        print(f"TensorProduct node_feats_irreps:{self.node_feats_irreps}, edge_attrs_irrpes:{self.edge_attrs_irreps}, irreps_mid:{irreps_mid}, instructions:{instructions}")
+
         # Convolution weights
         input_dim = self.edge_feats_irreps.num_irreps
         self.conv_tp_weights = nn.FullyConnectedNet(
@@ -715,6 +663,17 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         self.fused_mp = make_FastFusedMessagePassing()
         self.dim_list_tensor = torch.tensor([1,3,5,7], dtype=torch.int32, device="cuda")
         self.offs_tensor     = torch.tensor([0,1,4,9], dtype=torch.int32, device="cuda")
+
+
+        used_dtype = torch.float64
+        self.flashtp = flashTP_e3nn.uvu_TP(
+            self.node_feats_irreps,
+            self.edge_attrs_irreps,
+            irreps_mid,
+            instructions,
+            device="cuda", 
+            dtype=used_dtype
+        )
 
     def forward(
         self,
@@ -768,53 +727,51 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"========= mace residual interaction conv_tp_weights(e3nn.nn.FullyConnectedNet) cost: {execution_time_ms:.3f} ms ========")
-        
-        '''
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
 
+        
+        # ============= original implementaion =============
+        '''
         mji = self.conv_tp(
             node_feats[sender], edge_attrs, tp_weights
         )  # [n_edges, irreps]
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"========= mace residual interaction conv_tp(ChannelWiseTensorProduct) cost: {execution_time_ms:.3f} ms ========")
-
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
         
         message = scatter_sum(
             src=mji, index=receiver, dim=0, dim_size=num_nodes
         )  # [n_nodes, irreps]
-
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"========= mace residual interaction scatter_sum cost: {execution_time_ms:.3f} ms ========")
         '''
+        # =================================================
 
+
+        # ============= receiver-major fasteq =============
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
-        message = self.fused_mp.apply(node_feats, edge_attrs, tp_weights, sender, receiver, self.dim_list_tensor, self.offs_tensor)
+        # 1. 按 receiver 升序排序，得到 permutation
+        receiver_sorted, perm = torch.sort(receiver) 
+        # 2. 用 perm 重排所有按 edge 存储的张量
+        sender_sorted     = sender[perm]
+        edge_attrs_sorted = edge_attrs[perm]      # [E, DIM_SUM]
+        tp_weights_sorted = tp_weights[perm]      # [E, P, U]
 
-        '''
-        tp_weights_reshaped = tp_weights.view(tp_weights.shape[0], 4, -1)
+        message = self.fused_mp.apply(node_feats, edge_attrs_sorted, tp_weights_sorted, sender_sorted, receiver_sorted, self.dim_list_tensor, self.offs_tensor)
 
-        start_idx, end_idx = fused_mp_fwd.compute_sender_runs_sorted(sender, num_nodes)
-        message_diy = fused_mp_cuda(node_feats, edge_attrs, tp_weights_reshaped,
-                           receiver.int(), start_idx, end_idx,
-                           self.dim_list_tensor, self.offs_tensor)
-        message = message_diy.view(message_diy.shape[0], -1)
-        '''
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"========= my fused message passing cost: {execution_time_ms:.3f} ms ========")
 
+        # =================================================
+
+        
+        
+        #message = self.fused_mp.apply(node_feats, edge_attrs, tp_weights, sender, receiver, self.dim_list_tensor, self.offs_tensor)
+        
+        # Test FalshTP
+        #message = self.flashtp(node_feats, edge_attrs, tp_weights, sender.int(), receiver.int())
+
+        # =================================================
 
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
