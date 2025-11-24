@@ -528,8 +528,11 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         # =================================================
         '''
         
+        '''
         # ============= receiver major fasteq =============
-
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
         # 1. 按 receiver 升序排序，得到 permutation
         receiver_sorted, perm = torch.sort(receiver) 
         # 2. 用 perm 重排所有按 edge 存储的张量
@@ -537,25 +540,16 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         edge_attrs_sorted = edge_attrs[perm]      # [E, DIM_SUM]
         tp_weights_sorted = tp_weights[perm]      # [E, P, U]
 
-        print(f"receiver sorted: {receiver_sorted}")
-        print(f"sender: {sender_sorted}")
-
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-
-        
         message = self.fused_mp.apply(node_feats, edge_attrs_sorted, tp_weights_sorted, sender_sorted, receiver_sorted, self.dim_list_tensor, self.offs_tensor)
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"========= receiver major fused message passing cost: {execution_time_ms:.3f} ms ========")
-
         # =================================================
- 
+        '''
 
         # ============= sender major fasteq =============
-        '''
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
         
@@ -566,8 +560,8 @@ class RealAgnosticInteractionBlock(InteractionBlock):
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"========= my fused message passing cost: {execution_time_ms:.3f} ms ========")
-        '''
         # =================================================
+
         
         '''
         # Test FlashTP
@@ -742,13 +736,14 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
         '''
         # =================================================
 
-
+        '''
         # ============= receiver-major fasteq =============
+        # 1. 按 receiver 升序排序，得到 permutation
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
+        
+        receiver_sorted, perm = torch.sort(receiver)
 
-        # 1. 按 receiver 升序排序，得到 permutation
-        receiver_sorted, perm = torch.sort(receiver) 
         # 2. 用 perm 重排所有按 edge 存储的张量
         sender_sorted     = sender[perm]
         edge_attrs_sorted = edge_attrs[perm]      # [E, DIM_SUM]
@@ -756,17 +751,25 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
 
         message = self.fused_mp.apply(node_feats, edge_attrs_sorted, tp_weights_sorted, sender_sorted, receiver_sorted, self.dim_list_tensor, self.offs_tensor)
 
-
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"========= my fused message passing cost: {execution_time_ms:.3f} ms ========")
 
         # =================================================
+        '''
 
         
+        # ============= sender-major fasteq =============
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
-        #message = self.fused_mp.apply(node_feats, edge_attrs, tp_weights, sender, receiver, self.dim_list_tensor, self.offs_tensor)
+        message = self.fused_mp.apply(node_feats, edge_attrs, tp_weights, sender, receiver, self.dim_list_tensor, self.offs_tensor)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= my fused message passing cost: {execution_time_ms:.3f} ms ========")
         
         # Test FalshTP
         #message = self.flashtp(node_feats, edge_attrs, tp_weights, sender.int(), receiver.int())
