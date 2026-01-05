@@ -92,6 +92,7 @@ class Linear:
                 layout=cueq_config.layout,
                 shared_weights=shared_weights,
                 method="naive",
+                use_fasteq=True,
             )
 
         return o3.Linear(
@@ -172,6 +173,7 @@ class TensorProduct:
             and (cueq_config.optimize_all or cueq_config.optimize_channelwise)
         ):
             if cueq_config.conv_fusion:
+                '''
                 return with_cueq_conv_fusion(
                     cuet.SegmentedPolynomial(
                         cue.descriptors.channelwise_tensor_product(
@@ -186,6 +188,22 @@ class TensorProduct:
                         method="uniform_1d",
                     )
                 )
+
+                '''
+                # use fasteq
+                mptp = cuet.ChannelWiseTensorProduct(
+                    cue.Irreps(cueq_config.group, irreps_in1),
+                    cue.Irreps(cueq_config.group, irreps_in2),
+                    cue.Irreps(cueq_config.group, irreps_out),
+                    layout=cueq_config.layout,
+                    shared_weights=shared_weights,
+                    internal_weights=internal_weights,
+                    dtype=torch.get_default_dtype(),
+                    math_dtype=torch.get_default_dtype(),
+                    use_fasteq=True,
+                )
+                return with_cueq_conv_fusion(mptp.ff)
+
             return cuet.ChannelWiseTensorProduct(
                 cue.Irreps(cueq_config.group, irreps_in1),
                 cue.Irreps(cueq_config.group, irreps_in2),
@@ -195,6 +213,7 @@ class TensorProduct:
                 internal_weights=internal_weights,
                 dtype=torch.get_default_dtype(),
                 math_dtype=torch.get_default_dtype(),
+                use_fasteq=True,
             )
         if (
             OEQ_AVAILABLE
@@ -257,6 +276,7 @@ class FullyConnectedTensorProduct:
                 shared_weights=shared_weights,
                 internal_weights=internal_weights,
                 method="naive",
+                use_fasteq=True,
             )
 
         return o3.FullyConnectedTensorProduct(
@@ -298,6 +318,7 @@ class SymmetricContractionWrapper:
                 original_mace=(not use_reduced_cg),
                 dtype=torch.get_default_dtype(),
                 math_dtype=torch.get_default_dtype(),
+                use_fasteq=True,
             )
 
         return SymmetricContraction(
