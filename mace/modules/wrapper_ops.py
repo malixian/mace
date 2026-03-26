@@ -42,7 +42,8 @@ class CuEquivarianceConfig:
     optimize_channelwise: bool = False
     optimize_symmetric: bool = False
     optimize_fctp: bool = False
-    conv_fusion: bool = False  # Set to True to enable conv fusion
+    conv_fusion: bool = True  # Set to True to enable conv fusion
+    use_fasteq: bool = True # Whether to use FastEq for conv fusion (if enabled)
 
     def __post_init__(self):
         if self.enabled and CUET_AVAILABLE:
@@ -92,7 +93,7 @@ class Linear:
                 layout=cueq_config.layout,
                 shared_weights=shared_weights,
                 method="naive",
-                use_fasteq=True,
+                use_fasteq=cueq_config.use_fasteq,
             )
 
         return o3.Linear(
@@ -173,36 +174,35 @@ class TensorProduct:
             and (cueq_config.optimize_all or cueq_config.optimize_channelwise)
         ):
             if cueq_config.conv_fusion:
-                '''
-                return with_cueq_conv_fusion(
-                    cuet.SegmentedPolynomial(
-                        cue.descriptors.channelwise_tensor_product(
-                            cue.Irreps(cueq_config.group, irreps_in1),
-                            cue.Irreps(cueq_config.group, irreps_in2),
-                            cue.Irreps(cueq_config.group, irreps_out),
-                        )
-                        .flatten_coefficient_modes()
-                        .squeeze_modes()
-                        .polynomial,
+                if cueq_config.use_fasteq:
+                    mptp = cuet.ChannelWiseTensorProduct(
+                        cue.Irreps(cueq_config.group, irreps_in1),
+                        cue.Irreps(cueq_config.group, irreps_in2),
+                        cue.Irreps(cueq_config.group, irreps_out),
+                        layout=cueq_config.layout,
+                        shared_weights=shared_weights,
+                        internal_weights=internal_weights,
+                        dtype=torch.get_default_dtype(),
                         math_dtype=torch.get_default_dtype(),
-                        method="uniform_1d",
+                        use_fasteq=cueq_config.use_fasteq,
                     )
-                )
-
-                '''
-                # use fasteq
-                mptp = cuet.ChannelWiseTensorProduct(
-                    cue.Irreps(cueq_config.group, irreps_in1),
-                    cue.Irreps(cueq_config.group, irreps_in2),
-                    cue.Irreps(cueq_config.group, irreps_out),
-                    layout=cueq_config.layout,
-                    shared_weights=shared_weights,
-                    internal_weights=internal_weights,
-                    dtype=torch.get_default_dtype(),
-                    math_dtype=torch.get_default_dtype(),
-                    use_fasteq=True,
-                )
-                return with_cueq_conv_fusion(mptp.ff)
+                    return with_cueq_conv_fusion(mptp.ff)
+                
+                else:
+                    return with_cueq_conv_fusion(
+                        cuet.SegmentedPolynomial(
+                            cue.descriptors.channelwise_tensor_product(
+                                cue.Irreps(cueq_config.group, irreps_in1),
+                                cue.Irreps(cueq_config.group, irreps_in2),
+                                cue.Irreps(cueq_config.group, irreps_out),
+                            )
+                            .flatten_coefficient_modes()
+                            .squeeze_modes()
+                            .polynomial,
+                            math_dtype=torch.get_default_dtype(),
+                            method="uniform_1d",
+                        )
+                    )
 
             return cuet.ChannelWiseTensorProduct(
                 cue.Irreps(cueq_config.group, irreps_in1),
@@ -213,7 +213,7 @@ class TensorProduct:
                 internal_weights=internal_weights,
                 dtype=torch.get_default_dtype(),
                 math_dtype=torch.get_default_dtype(),
-                use_fasteq=True,
+                use_fasteq=cueq_config.use_fasteq,
             )
         if (
             OEQ_AVAILABLE
@@ -276,7 +276,7 @@ class FullyConnectedTensorProduct:
                 shared_weights=shared_weights,
                 internal_weights=internal_weights,
                 method="naive",
-                use_fasteq=True,
+                use_fasteq=cueq_config.use_fasteq,
             )
 
         return o3.FullyConnectedTensorProduct(
@@ -318,7 +318,7 @@ class SymmetricContractionWrapper:
                 original_mace=(not use_reduced_cg),
                 dtype=torch.get_default_dtype(),
                 math_dtype=torch.get_default_dtype(),
-                use_fasteq=True,
+                use_fasteq=cueq_config.use_fasteq,
             )
 
         return SymmetricContraction(
