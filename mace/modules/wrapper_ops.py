@@ -93,7 +93,7 @@ class Linear:
                 layout=cueq_config.layout,
                 shared_weights=shared_weights,
                 method="naive",
-                use_fasteq=cueq_config.use_fasteq,
+                #use_fasteq=cueq_config.use_fasteq, 
             )
 
         return o3.Linear(
