@@ -625,6 +625,7 @@ class ScaleShiftMACE(MACE):
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"==== MACE backward cost: {execution_time_ms:.3f} ms ====")
+        print(f"==== edge num:{edge_feats.shape[0]}, atomic num:{node_feats.shape[0]}")
 
         atomic_virials: Optional[torch.Tensor] = None
         atomic_stresses: Optional[torch.Tensor] = None

@@ -629,22 +629,14 @@ class RealAgnosticInteractionBlock(InteractionBlock):
             torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
-            print(f"<< cueq mptp forward cost: {execution_time_ms:.3f} ms >>")
+            print(f"<< mptp forward cost: {execution_time_ms:.3f} ms >>")
         else:
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
-
             mji = self.conv_tp(
                 node_feats[edge_index[0]], edge_attrs, tp_weights
             )  # [n_nodes, irreps]
             message = scatter_sum(
                 src=mji, index=edge_index[1], dim=0, dim_size=node_feats.shape[0]
             )
-
-            torch.cuda.synchronize()
-            end_time = time.perf_counter() * 1000
-            execution_time_ms = end_time - start_time
-            print(f"<< cueq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
         message = self.linear(message) / self.avg_num_neighbors
@@ -748,22 +740,14 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
             torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
-            print(f"<< cueq mptp forward cost: {execution_time_ms:.3f} ms >>")
+            print(f"<< mptp forward cost: {execution_time_ms:.3f} ms >>")
         else:
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
-
             mji = self.conv_tp(
                 node_feats[edge_index[0]], edge_attrs, tp_weights
             )  # [n_nodes, irreps]
             message = scatter_sum(
                 src=mji, index=edge_index[1], dim=0, dim_size=node_feats.shape[0]
             )
-
-            torch.cuda.synchronize()
-            end_time = time.perf_counter() * 1000
-            execution_time_ms = end_time - start_time
-            print(f"<< cueq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         message = self.truncate_ghosts(message, n_real)
         node_attrs = self.truncate_ghosts(node_attrs, n_real)
         sc = self.truncate_ghosts(sc, n_real)
@@ -875,7 +859,16 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
         )  # [n_nodes, 1]
         message = None
         if hasattr(self, "conv_fusion"):
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< mptp forward cost: {execution_time_ms:.3f} ms >>")
         else:
             mji = self.conv_tp(
                 node_feats[edge_index[0]], edge_attrs, tp_weights
@@ -999,7 +992,15 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
 
         message = None
         if hasattr(self, "conv_fusion"):
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< mptp forward cost: {execution_time_ms:.3f} ms >>")
         else:
             mji = self.conv_tp(
                 node_feats[edge_index[0]], edge_attrs, tp_weights

@@ -201,7 +201,8 @@ def run(
         layout="ir_mul",
         group="O3_e3nn",
         optimize_all=True,
-        conv_fusion=(device == "cuda"),
+        #conv_fusion=(device == "cuda"),
+        conv_fusion=True,
     )
 
     # Create new model with cuequivariance config

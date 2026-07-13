@@ -125,7 +125,7 @@ def with_scatter_sum(conv_tp: torch.nn.Module) -> torch.nn.Module:
     conv_tp.forward = types.MethodType(forward, conv_tp)
     return conv_tp
 
-
+'''
 def with_cueq_conv_fusion(conv_tp: torch.nn.Module) -> torch.nn.Module:
     """Wraps a cuet.ConvTensorProduct to use conv fusion"""
     conv_tp.original_forward = conv_tp.forward
@@ -151,7 +151,53 @@ def with_cueq_conv_fusion(conv_tp: torch.nn.Module) -> torch.nn.Module:
 
     conv_tp.forward = types.MethodType(forward, conv_tp)
     return conv_tp
+'''
 
+class CueqConvFusionWrapper(torch.nn.Module):
+    """A serializable wrapper around cuet.SegmentedPolynomial / mptp.ff.
+
+    It adapts MACE conv-style forward:
+
+        forward(node_feats, edge_attrs, tp_weights, edge_index)
+
+    to cuEq SegmentedPolynomial forward:
+
+        forward([tp_weights, node_feats, edge_attrs], input_indices, output_shapes, output_indices)
+    """
+
+    def __init__(self, conv_tp: torch.nn.Module):
+        super().__init__()
+        self.conv_tp = conv_tp
+
+        num_segment = conv_tp.m.buffer_num_segments[0]
+        num_operands = conv_tp.m.operand_extent
+        self.weight_numel = num_segment * num_operands
+
+    @property
+    def m(self):
+        return self.conv_tp.m
+
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        edge_attrs: torch.Tensor,
+        tp_weights: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        sender = edge_index[0]
+        receiver = edge_index[1]
+
+        return self.conv_tp(
+            [tp_weights, node_feats, edge_attrs],
+            {1: sender},
+            {0: node_feats},
+            {0: receiver},
+        )[0]
+
+
+def with_cueq_conv_fusion(conv_tp: torch.nn.Module) -> torch.nn.Module:
+    """Wraps a cuet.SegmentedPolynomial / ConvTensorProduct to use conv fusion."""
+    return CueqConvFusionWrapper(conv_tp)
 
 class TensorProduct:
     """Wrapper around o3.TensorProduct/cuet.ChannelwiseTensorProduct/oeq.TensorProduct followed by a scatter sum"""
@@ -184,6 +230,7 @@ class TensorProduct:
                         internal_weights=internal_weights,
                         dtype=torch.get_default_dtype(),
                         math_dtype=torch.get_default_dtype(),
+                        method="uniform_1d",
                         use_fasteq=cueq_config.use_fasteq,
                     )
                     return with_cueq_conv_fusion(mptp.ff)
